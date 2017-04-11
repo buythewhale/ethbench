@@ -13,6 +13,7 @@ import (
 	"time"
 	"os"
 	"os/signal"
+	term "github.com/nsf/termbox-go"
 )
 
 var succeeded int32
@@ -20,6 +21,12 @@ var failed int32
 var startedAt = time.Now()
 
 func main() {
+	err := term.Init()
+	if err != nil {
+		panic(err)
+	}
+
+	defer term.Close()
 	concurrency, duration, to, endpoints, accounts := parseArgs()
 	if len(endpoints) != len(accounts) {
 		log.Printf("Number of endpoints (%v) doesn't match number of accounts (%v)", len(endpoints), len(accounts))
@@ -49,10 +56,25 @@ func main() {
 		}
 	}()
 
+	go printOnEnter()
+
 	time.Sleep(duration)
 
 	printResults()
 }
+
+func printOnEnter() {
+	for {
+		switch ev := term.PollEvent(); ev.Type {
+		case term.EventKey:
+			switch ev.Key {
+			case term.KeyEnter:
+				printResults()
+			}
+		}
+	}
+}
+
 func printThroughput() {
 	last := succeeded
 	ticker := time.NewTicker(1 * time.Second)
