@@ -9,61 +9,107 @@ import (
 	"path"
 	"runtime"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
+	"os"
+	"os/signal"
 )
 
-func main() {
-	concurrency, number, to, socketPath, from := parseArgs()
+var succeeded int32
+var failed int32
+var startedAt = time.Now()
 
-	socket, _ := net.Dial("unix", socketPath)
-	defer socket.Close()
-	runBenchmark(socket, from, to, number, concurrency)
+func main() {
+	concurrency, duration, to, endpoints, accounts := parseArgs()
+	if len(endpoints) != len(accounts) {
+		log.Printf("Number of endpoints (%v) doesn't match number of accounts (%v)", len(endpoints), len(accounts))
+		return
+	}
+
+	for i := 0; i < len(endpoints); i++ {
+		socket, err := net.Dial("unix", endpoints[i])
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		//noinspection GoDeferInLoop
+		defer socket.Close()
+
+		go runBenchmark(socket, accounts[i], to, concurrency)
+	}
+
+	go printThroughput()
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		for range c {
+			printResults()
+			os.Exit(0)
+		}
+	}()
+
+	time.Sleep(duration)
+
+	printResults()
 }
-func parseArgs() (concurrency int, number int, to string, socketPath string, from string) {
-	_concurrency := flag.Int("concurrency", 10, "Number of concurrently sent requests")
-	_number := flag.Int("number", 100, "Total number of requests to send")
+func printThroughput() {
+	last := succeeded
+	ticker := time.NewTicker(1 * time.Second)
+	for {
+		select {
+		case <-ticker.C:
+			sentPerSec := succeeded - last
+			last += sentPerSec
+			log.Printf("%v tx/s", sentPerSec)
+			// do stuff
+		}
+	}
+}
+func printResults() {
+	fmt.Println()
+	took := time.Since(startedAt)
+	total := succeeded + failed
+	log.Printf(
+		"%v succeeded, %v failed, success rate %.2f",
+		succeeded,
+		failed,
+		float64(succeeded)/float64(total),
+	)
+	log.Printf("test time %v, %.2f tx/s total, %.2f tx/s successful",
+		took,
+		float64(total)/took.Seconds(),
+		float64(succeeded)/took.Seconds(),
+	)
+}
+
+func parseArgs() (concurrency int, duration time.Duration, to string, endpoints []string, accounts []string) {
+	_concurrency := flag.Int("concurrency", 10, "Number of concurrently succeeded requests")
+	_duration := flag.Int64("duration", (1<<63-1)/int64(time.Second), "Test duration in seconds")
 	_to := flag.String("to", "0x00E3d1Aa965aAfd61217635E5f99f7c1e567978f", "Recipient address")
-	_socketPath := flag.String("socket", getDefaultSocketPath(), "IPC socket path")
+	_endpoints := flag.String("endpoints", getDefaultSocketPath(), "IPC socket paths")
 	flag.Parse()
 	_from := flag.Arg(0)
-	return *_concurrency, *_number, *_to, *_socketPath, _from
+	return *_concurrency, time.Duration(*_duration * int64(time.Second)), *_to, strings.Split(*_endpoints, ","), strings.Split(_from, ",")
 }
-func runBenchmark(socket net.Conn, from string, to string, number int, concurrency int) {
-	startedAt := time.Now()
-	var failed int32 = 0
-	tasks := make(chan int, number)
-	for i := 0; i < number; i++ {
-		tasks <- i
-	}
-	var wg sync.WaitGroup
+
+func runBenchmark(socket net.Conn, from string, to string, concurrency int) {
+	tasks := make(chan int)
+
 	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
 		go func() {
 			for range tasks {
 				if !sendEther(socket, from, to) {
 					atomic.AddInt32(&failed, 1)
+				} else {
+					atomic.AddInt32(&succeeded, 1)
 				}
 			}
-			wg.Done()
 		}()
 	}
-	close(tasks)
-	wg.Wait()
-	took := time.Since(startedAt)
-	succeed := number - int(failed)
-	log.Printf(
-		"%v succeeded, %v failed, success rate %.2f",
-		succeed,
-		failed,
-		float64(succeed)/float64(number),
-	)
-	log.Printf("took %v, %.2f tx/s total, %.2f tx/s successful",
-		took,
-		float64(number)/took.Seconds(),
-		float64(succeed)/took.Seconds(),
-	)
+	for i := 0; ; i++ {
+		tasks <- i
+	}
 }
 
 func sendEther(socket net.Conn, from string, to string) bool {
